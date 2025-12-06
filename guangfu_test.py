@@ -5,6 +5,8 @@ import logging
 import threading
 from datetime import datetime
 
+session = requests.Session()
+
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -68,6 +70,7 @@ stable_voltage_start_time = None  # 电压进入稳定范围的开始时间
 last_fine_tune_time = 0  # 上次微调时间
 last_control_value = 0  # 上次控制值
 last_active_power_value = 1000  # 上次有功功率值
+active_power_adjusted = False  # 标记本轮微调是否执行过有功功率调节
 
 # 控制状态
 current_reactive_power_value = 0  # 当前无功功率控制值（第一台逆变器）
@@ -81,47 +84,99 @@ current_active_power_value = 1000  # 当时有功功率值
 upper_threshold = config["nominal_voltage"] * config["upper_threshold_ratio"]
 lower_threshold = config["nominal_voltage"] * config["lower_threshold_ratio"]
 
+DEFAULT_TIMEOUT = 10
+
+def request_api(path, payload, retries=1, method="post"):
+    """统一的 API 请求入口，带会话、超时与重试。"""
+    url = f"{config['base_url']}{path}"
+    headers = {"Content-Type": "application/json"}
+
+    for attempt in range(1, retries + 1):
+        try:
+            response = session.request(
+                method=method,
+                url=url,
+                json=payload,
+                headers=headers,
+                timeout=DEFAULT_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            logging.error(
+                "API 请求异常: path=%s attempt=%d error=%s payload=%s",
+                path,
+                attempt,
+                exc,
+                payload,
+            )
+            if attempt < retries:
+                time.sleep(1)
+            continue
+
+        if not 200 <= response.status_code < 300:
+            logging.error(
+                "API 响应错误: path=%s status=%s body=%s payload=%s",
+                path,
+                response.status_code,
+                response.text,
+                payload,
+            )
+            if attempt < retries:
+                time.sleep(1)
+            continue
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            logging.error(
+                "API JSON 解析失败: path=%s error=%s body=%s",
+                path,
+                exc,
+                response.text,
+            )
+            if attempt < retries:
+                time.sleep(1)
+            continue
+
+    return None
+
+def write_tag(group, tag, value, node=None, retries=1):
+    """统一的写入接口，返回是否成功。"""
+    payload = {
+        "node": node or config["node"],
+        "group": group,
+        "tag": tag,
+        "value": value,
+    }
+
+    result = request_api("/write", payload, retries=retries)
+    if result is None:
+        logging.error(
+            "写入失败: group=%s tag=%s value=%s payload=%s",
+            group,
+            tag,
+            value,
+            payload,
+        )
+        return False
+
+    logging.info("写入成功: group=%s tag=%s value=%s", group, tag, value)
+    return True
+
 def read_inverter_data():
     """读取逆变器数据"""
-    try:
-        url = f"{config['base_url']}/read"
-        payload = {
-            "node": config["node"],
-            "group": config["group"]
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logging.error(f"读取失败: {response.status_code}")
-            return None
-    except Exception as e:
-        logging.error(f"读取异常: {e}")
-        return None
+    payload = {
+        "node": config["node"],
+        "group": config["group"],
+    }
+    return request_api("/read", payload, retries=3)
 
 def read_inverter2_data():
     """读取第二个逆变器数据"""
-    try:
-        url = f"{config['base_url']}/read"
-        payload = {
-            "node": config["node"],
-            "group": "invert2"
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logging.error(f"读取第二个逆变器失败: {response.status_code}")
-            return None
-    except Exception as e:
-        logging.error(f"读取第二个逆变器异常: {e}")
-        return None
+    payload = {
+        "node": config["node"],
+        "group": "invert2",
+    }
+    return request_api("/read", payload, retries=3)
 
 def get_reactive_power_value(data):
     """获取无功功率值"""
@@ -228,49 +283,20 @@ def get_second_reactive_power_value():
 
 def write_second_control_value(control_value):
     """写入第二台逆变器控制值"""
-    try:
-        url = f"{config['base_url']}/write"
-        payload = {
-            "node": config["node"],
-            "group": "invert2",
-            "tag": config["control_tag"],
-            "value": control_value
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            logging.info(f"第二台逆变器控制成功: {config['control_tag']} = {control_value}")
-            return True
-        else:
-            logging.error(f"第二台逆变器控制失败: {response.status_code}")
-            return False
-    except Exception as e:
-        logging.error(f"第二台逆变器控制异常: {e}")
-        return False
+    if write_tag("invert2", config["control_tag"], control_value):
+        logging.info(f"第二台逆变器控制成功: {config['control_tag']} = {control_value}")
+        return True
+
+    logging.error(f"第二台逆变器控制失败: {control_value}")
+    return False
 
 def read_transformer_data():
     """读取台区变压器数据 (假设存在独立的变压器/电表节点)"""
-    try:
-        url = f"{config['base_url']}/read"
-        payload = {
-            "node": config["node"],
-            "group": "transformer" # 假设组名为 transformer
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            # 如果读取失败，为了演示逻辑，尝试作为fallback处理 (实际应记录错误)
-            # logging.error(f"读取变压器失败: {response.status_code}")
-            return None
-    except Exception as e:
-        logging.error(f"读取变压器异常: {e}")
-        return None
+    payload = {
+        "node": config["node"],
+        "group": "transformer"  # 假设组名为 transformer
+    }
+    return request_api("/read", payload, retries=3)
 
 def get_transformer_voltage():
     """获取变压器电压"""
@@ -304,27 +330,12 @@ def cut_out_inverter(inverter_id):
 
 def write_second_active_power_value(power_value):
     """写入第二台逆变器有功功率值"""
-    try:
-        url = f"{config['base_url']}/write"
-        payload = {
-            "node": config["node"],
-            "group": "invert2",
-            "tag": config["active_power_tag"], # 假设 tag 名相同
-            "value": power_value
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            logging.info(f"第二台逆变器有功控制成功: {power_value}")
-            return True
-        else:
-            logging.error(f"第二台逆变器有功控制失败: {response.status_code}")
-            return False
-    except Exception as e:
-        logging.error(f"第二台逆变器有功控制异常: {e}")
-        return False
+    if write_tag("invert2", config["active_power_tag"], power_value):
+        logging.info(f"第二台逆变器有功控制成功: {power_value}")
+        return True
+
+    logging.error(f"第二台逆变器有功控制失败: {power_value}")
+    return False
 
 def check_and_perform_cutout(v1, v2):
     """
@@ -544,6 +555,8 @@ def active_power_control(voltage):
 def fine_tune_control(voltage):
     """微调控制函数，用于电压未达到稳定范围时的进一步调节"""
     global last_control_value, last_fine_tune_time, control_executed, last_control_time, last_active_power_value, active_power_adjusted
+
+    active_power_adjusted = False
     
     # 检查电压是否在稳定范围内
     if voltage >= 395 and voltage <= 400:
@@ -828,59 +841,29 @@ def get_active_power_value(data):
 def write_control_value(control_value=None):
     """写入控制值"""
     global control_start_time, control_value_set
-    try:
-        # 如果没有提供控制值，则使用配置中的默认值
-        if control_value is None:
-            control_value = config["control_value"]
-        
-        # 记录控制开始时间
-        control_start_time = time.time() * 1000  # 转换为毫秒
-        control_value_set = False
-        
-        url = f"{config['base_url']}/write"
-        payload = {
-            "node": config["node"],
-            "group": config["group"],
-            "tag": config["control_tag"],
-            "value": control_value
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            logging.info(f"控制成功: {config['control_tag']} = {control_value}")
-            return True
-        else:
-            logging.error(f"控制失败: {response.status_code}")
-            return False
-    except Exception as e:
-        logging.error(f"控制异常: {e}")
-        return False
+    # 如果没有提供控制值，则使用配置中的默认值
+    if control_value is None:
+        control_value = config["control_value"]
+
+    # 记录控制开始时间
+    control_start_time = time.time() * 1000  # 转换为毫秒
+    control_value_set = False
+
+    if write_tag(config["group"], config["control_tag"], control_value):
+        logging.info(f"控制成功: {config['control_tag']} = {control_value}")
+        return True
+
+    logging.error(f"控制失败: {config['control_tag']} = {control_value}")
+    return False
 
 def write_active_power_value(power_value):
     """写入有功功率值"""
-    try:
-        url = f"{config['base_url']}/write"
-        payload = {
-            "node": config["node"],
-            "group": config["group"],
-            "tag": config["active_power_tag"],
-            "value": power_value
-        }
-        headers = {"Content-Type": "application/json"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            logging.info(f"有功功率控制成功: {config['active_power_tag']} = {power_value}")
-            return True
-        else:
-            logging.error(f"有功功率控制失败: {response.status_code}")
-            return False
-    except Exception as e:
-        logging.error(f"有功功率控制异常: {e}")
-        return False
+    if write_tag(config["group"], config["active_power_tag"], power_value):
+        logging.info(f"有功功率控制成功: {config['active_power_tag']} = {power_value}")
+        return True
+
+    logging.error(f"有功功率控制失败: {power_value}")
+    return False
 
 def should_control(voltage):
     """判断是否需要进行控制"""
@@ -910,7 +893,7 @@ def main():
     """主函数"""
     global control_start_time, voltage_recovery_start_time, control_value_set, control_executed, last_control_time, stable_voltage_start_time, last_control_value, last_fine_tune_time
     global current_reactive_power_value, reactive_power_reached_limit, active_power_in_progress, current_active_power_value
-    global second_reactive_power_value, second_reactive_reached_limit
+    global second_reactive_power_value, second_reactive_reached_limit, active_power_adjusted
     logging.info("开始监控逆变器电压...")
     logging.info(f"电压上限阈值: {upper_threshold:.1f}V")
     logging.info(f"电压下限阈值: {lower_threshold:.1f}V")
@@ -1026,14 +1009,7 @@ def main():
                         reactive_power_reached_limit = False
                         second_reactive_reached_limit = False
                         active_power_in_progress = False
-                    
-                    # 3. 检查电压是否在稳定范围内
-                    if voltage >= 395 and voltage <= 400:
-                        # 电压稳定，重置所有标志
-                        if not (voltage >= 395 and voltage <= 400):
-                            logging.info(f"电压已稳定在({voltage:.2f}V)，重置控制状态")
-                        reactive_power_reached_limit = False
-                        active_power_in_progress = False
+                        active_power_adjusted = False
                     else:
                         # 电压在正常范围内，无需控制
                         voltage_deviation = voltage - config["nominal_voltage"]
