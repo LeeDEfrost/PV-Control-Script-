@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 
 session = requests.Session()
@@ -77,26 +78,27 @@ ACTIVE_POWER_FINE_TUNE_STEP = 250  # 有功功率微调步长
 MAX_CONTROL_VALUE = 500  # 最大控制值
 MIN_CONTROL_VALUE = -500  # 最小控制值，修改为-500以适应控制算法范围
 
-# 全局变量用于记录时间
-control_start_time = None
-voltage_recovery_start_time = None
-control_value_set = False
-control_executed = False
-last_voltage = None  # 用于存储上一次的电压值
-last_control_time = 0  # 上次控制时间
-stable_voltage_start_time = None  # 电压进入稳定范围的开始时间
-last_fine_tune_time = 0  # 上次微调时间
-last_control_value = 0  # 上次控制值
-last_active_power_value = 1000  # 上次有功功率值
-active_power_adjusted = False  # 标记本轮微调是否执行过有功功率调节
+@dataclass
+class ControlContext:
+    """集中管理控制过程中的可变状态，避免全局变量散落。"""
 
-# 控制状态
-current_reactive_power_value = 0  # 当前无功功率控制值（第一台逆变器）
-second_reactive_power_value = 0  # 第二台逆变器无功功率控制值
-reactive_power_reached_limit = False  # 第一台逆变器无功功率是否已达到极限值
-second_reactive_reached_limit = False  # 第二台逆变器无功功率是否已达到极限值
-active_power_in_progress = False  # 是否正在进行有功功率调节
-current_active_power_value = 1000  # 当时有功功率值
+    control_start_time: float | None = None
+    voltage_recovery_start_time: float | None = None
+    control_value_set: bool = False
+    control_executed: bool = False
+    last_voltage: float | None = None
+    last_control_time: float = 0.0
+    stable_voltage_start_time: float | None = None
+    last_fine_tune_time: float = 0.0
+    last_control_value: float = 0.0
+    last_active_power_value: float = 1000.0
+    active_power_adjusted: bool = False
+    current_reactive_power_value: float = 0.0
+    second_reactive_power_value: float = 0.0
+    reactive_power_reached_limit: bool = False
+    second_reactive_reached_limit: bool = False
+    active_power_in_progress: bool = False
+    current_active_power_value: float = 1000.0
 
 # 计算上下限阈值
 upper_threshold = config["nominal_voltage"] * config["upper_threshold_ratio"]
@@ -420,16 +422,19 @@ def calculate_active_power_value(voltage_deviation):
     
     return active_power_value
 
-def second_reactive_power_control(voltage):
+def second_reactive_power_control(voltage, context: ControlContext):
     """第二台逆变器无功功率控制函数"""
-    global second_reactive_power_value, second_reactive_reached_limit
-    
+
     # 获取第二台逆变器当前无功功率值
     current_second_reactive = get_second_reactive_power_value()
     if current_second_reactive is not None:
-        second_reactive_power_value = current_second_reactive
-    
-    logging.info(f"第二台逆变器无功功率控制: 当前={second_reactive_power_value:.2f}, 电压={voltage:.2f}V")
+        context.second_reactive_power_value = current_second_reactive
+
+    logging.info(
+        "第二台逆变器无功功率控制: 当前=%.2f, 电压=%.2fV",
+        context.second_reactive_power_value,
+        voltage,
+    )
     
     retry = 0
     max_retries = 20
@@ -459,22 +464,22 @@ def second_reactive_power_control(voltage):
         delta_v_calc = config['nominal_voltage'] - voltage
         adjustment = k * delta_v_calc
         
-        target_reactive_power = second_reactive_power_value + adjustment
+        target_reactive_power = context.second_reactive_power_value + adjustment
         
         # 5. 限制范围
         target_reactive_power = max(MIN_CONTROL_VALUE, min(MAX_CONTROL_VALUE, target_reactive_power))
         
         # 检查是否卡在边界
-        if abs(target_reactive_power - second_reactive_power_value) < 0.1:
+        if abs(target_reactive_power - context.second_reactive_power_value) < 0.1:
             logging.info(f"第二台无功功率({target_reactive_power:.1f})已无可调节空间")
             if target_reactive_power <= MIN_CONTROL_VALUE or target_reactive_power >= MAX_CONTROL_VALUE:
-                second_reactive_reached_limit = True
+                context.second_reactive_reached_limit = True
                 return False
             break
 
         # 6. 执行调节
         if write_second_control_value(target_reactive_power):
-            second_reactive_power_value = target_reactive_power
+            context.second_reactive_power_value = target_reactive_power
             logging.info(f"第二台无功调节: 偏差{abs_dev:.1f}V, k={k}, 调整{adjustment:.1f}, 目标Q={target_reactive_power:.1f}")
         else:
             logging.error("第二台无功调节失败")
@@ -493,17 +498,16 @@ def second_reactive_power_control(voltage):
         
     return True
 
-def active_power_control(voltage):
+def active_power_control(voltage, context: ControlContext):
     """有功功率控制函数 - 三段式变参数调节"""
-    global current_active_power_value, active_power_in_progress
-    
+
     # 设置有功功率调节标志
-    active_power_in_progress = True
+    context.active_power_in_progress = True
     
     # 获取当前有功功率值
     current_power = get_active_power_value(read_inverter_data())
     if current_power is None:
-        current_power = current_active_power_value
+        current_power = context.current_active_power_value
     
     logging.info(f"开始有功功率调节: 当前={current_power:.1f}W, 电压={voltage:.2f}V")
     
@@ -550,7 +554,7 @@ def active_power_control(voltage):
         # 6. 执行调节
         if write_active_power_value(target_power):
             current_power = target_power
-            current_active_power_value = target_power
+            context.current_active_power_value = target_power
             logging.info(f"有功调节: 电压{voltage:.2f}V, 偏差{abs_dev:.1f}V, k={k}, 调整{adjustment:.1f}, 目标P={target_power:.1f}")
         else:
             logging.error("有功功率调节失败")
@@ -567,22 +571,21 @@ def active_power_control(voltage):
             
         retry += 1
         
-    active_power_in_progress = False
+    context.active_power_in_progress = False
     return success
 
-def fine_tune_control(voltage):
+def fine_tune_control(voltage, context: ControlContext):
     """微调控制函数，用于电压未达到稳定范围时的进一步调节"""
-    global last_control_value, last_fine_tune_time, control_executed, last_control_time, last_active_power_value, active_power_adjusted
 
-    active_power_adjusted = False
+    context.active_power_adjusted = False
     
     # 检查电压是否在稳定范围内
     if voltage >= 395 and voltage <= 400:
         logging.info(f"电压 {voltage:.2f}V 已在稳定范围内，无需微调")
         # 重置控制执行标志，允许再次执行控制
-        control_executed = False
+        context.control_executed = False
         # 重置有功功率调节标志
-        active_power_adjusted = False
+        context.active_power_adjusted = False
         return False
     
     # 检查是否到了微调时间
@@ -600,31 +603,31 @@ def fine_tune_control(voltage):
     # 如果电压偏差很大，忽略微调时间间隔限制
     if very_severe_deviation or severe_deviation:
         logging.info(f"电压偏差较大({voltage_deviation:.2f}V)，忽略微调时间间隔限制")
-    elif current_time - last_fine_tune_time < FINE_TUNE_INTERVAL:
-        logging.debug(f"微调间隔未到: 当前时间={current_time:.2f}, 上次微调时间={last_fine_tune_time:.2f}, 间隔={(current_time - last_fine_tune_time):.2f}s")
+    elif current_time - context.last_fine_tune_time < FINE_TUNE_INTERVAL:
+        logging.debug(f"微调间隔未到: 当前时间={current_time:.2f}, 上次微调时间={context.last_fine_tune_time:.2f}, 间隔={(current_time - context.last_fine_tune_time):.2f}s")
         return False
     
     # 更新上次微调时间
-    last_fine_tune_time = current_time
+    context.last_fine_tune_time = current_time
     
     # 对于严重偏离的情况，检查是否应该调节有功功率
     if severe_deviation or (voltage > 400 or voltage < 395):
         # 检查无功功率是否已经调节到极限值
-        if last_control_value > MIN_CONTROL_VALUE and voltage_deviation > 10:  # 电压偏高且无功功率还未调节到-200
-            logging.info(f"电压偏高({voltage:.2f}V)，但无功功率({last_control_value:.1f})未达极限值(-200)，继续调节无功功率")
+        if context.last_control_value > MIN_CONTROL_VALUE and voltage_deviation > 10:  # 电压偏高且无功功率还未调节到-200
+            logging.info(f"电压偏高({voltage:.2f}V)，但无功功率({context.last_control_value:.1f})未达极限值(-200)，继续调节无功功率")
             # 不调节有功功率，返回False让系统继续调节无功功率
             return False
-        elif last_control_value < MAX_CONTROL_VALUE and voltage_deviation < -10:  # 电压偏低且无功功率还未调节到200
-            logging.info(f"电压偏低({voltage:.2f}V)，但无功功率({last_control_value:.1f})未达极限值(200)，继续调节无功功率")
+        elif context.last_control_value < MAX_CONTROL_VALUE and voltage_deviation < -10:  # 电压偏低且无功功率还未调节到200
+            logging.info(f"电压偏低({voltage:.2f}V)，但无功功率({context.last_control_value:.1f})未达极限值(200)，继续调节无功功率")
             # 不调节有功功率，返回False让系统继续调节无功功率
             return False
         else:
             # 无功功率已经调节到极限值，检查当前无功功率是否已经在极限值且电压仍然偏高
-            if (last_control_value <= MIN_CONTROL_VALUE or last_control_value >= MAX_CONTROL_VALUE) and abs(voltage_deviation) > 10:
+            if (context.last_control_value <= MIN_CONTROL_VALUE or context.last_control_value >= MAX_CONTROL_VALUE) and abs(voltage_deviation) > 10:
                 # 无功功率已经在极限值且电压仍然偏高，才调节有功功率
                 current_power = get_active_power_value(read_inverter_data())
                 if current_power is None:
-                    current_power = last_active_power_value  # 使用上次的值
+                    current_power = context.last_active_power_value  # 使用上次的值
                 
                 # 计算目标有功功率值
                 target_power = calculate_active_power_value(voltage_deviation)
@@ -655,14 +658,14 @@ def fine_tune_control(voltage):
                 
                 if write_active_power_value(new_power):
                     logging.info(f"电压严重偏离({voltage:.2f}V)，无功已达极限值，{direction}有功功率: {current_power:.1f} -> {new_power:.1f}")
-                    last_active_power_value = new_power
-                    active_power_adjusted = True
+                    context.last_active_power_value = new_power
+                    context.active_power_adjusted = True
                     return True
             else:
                 # 无功功率已经调节到极限值，可以调节有功功率来辅助控制电压
                 current_power = get_active_power_value(read_inverter_data())
                 if current_power is None:
-                    current_power = last_active_power_value  # 使用上次的值
+                    current_power = context.last_active_power_value  # 使用上次的值
                 
                 # 计算目标有功功率值
                 target_power = calculate_active_power_value(voltage_deviation)
@@ -693,8 +696,8 @@ def fine_tune_control(voltage):
                 
                 if write_active_power_value(new_power):
                     logging.info(f"电压偏离({voltage:.2f}V)，无功已达极限值，辅助{direction}有功功率: {current_power:.1f} -> {new_power:.1f}")
-                    last_active_power_value = new_power
-                    active_power_adjusted = True
+                    context.last_active_power_value = new_power
+                    context.active_power_adjusted = True
                     return True
     
     # 计算需要调整的控制值
@@ -726,49 +729,48 @@ def fine_tune_control(voltage):
         # 电压在稳定范围内
         logging.info(f"电压 {voltage:.2f}V 已在稳定范围内，无需微调")
         # 重置控制执行标志，允许再次执行控制
-        control_executed = False
+        context.control_executed = False
         # 重置有功功率调节标志
-        active_power_adjusted = False
+        context.active_power_adjusted = False
         return False
     
     # 计算新的控制值
-    new_control_value = last_control_value + control_adjustment
+    new_control_value = context.last_control_value + control_adjustment
     new_control_value = max(MIN_CONTROL_VALUE, min(MAX_CONTROL_VALUE, new_control_value))
     
     # 如果控制值没有变化，则不需要调整
-    if abs(new_control_value - last_control_value) < 0.001:
+    if abs(new_control_value - context.last_control_value) < 0.001:
         logging.info(f"电压 {voltage:.2f}V 未在稳定范围内，但控制值无需调整")
         return False
     
     # 如果新控制值与上次相同，则尝试逐步调整
-    if abs(new_control_value - last_control_value) < 0.1:
+    if abs(new_control_value - context.last_control_value) < 0.1:
         # 使用更小的步长进行调整
         if voltage > 400:
-            new_control_value = max(MIN_CONTROL_VALUE, last_control_value - 10)  # 每次减10
+            new_control_value = max(MIN_CONTROL_VALUE, context.last_control_value - 10)  # 每次减10
         elif voltage < 395:
-            new_control_value = min(MAX_CONTROL_VALUE, last_control_value + 10)  # 每次加10
+            new_control_value = min(MAX_CONTROL_VALUE, context.last_control_value + 10)  # 每次加10
         
         # 再次检查是否与上次相同
-        if abs(new_control_value - last_control_value) < 0.1:
+        if abs(new_control_value - context.last_control_value) < 0.1:
             logging.info(f"电压 {voltage:.2f}V 未在稳定范围内，但控制值变化太小，无需调整")
             return False
     
     logging.info(f"电压 {voltage:.2f}V 未在稳定范围内，进行微调: 调整值 {control_adjustment}, 新控制值 {new_control_value}")
     
     # 发送新的控制值
-    if write_control_value(new_control_value):
-        last_control_value = new_control_value
+    if write_control_value(new_control_value, context):
+        context.last_control_value = new_control_value
         # 更新控制执行时间，防止立即触发新的控制
-        last_control_time = time.time()
-        control_executed = True  # 标记为已执行控制
+        context.last_control_time = time.time()
+        context.control_executed = True  # 标记为已执行控制
         return True
     else:
         logging.error("微调控制值发送失败")
         return False
 
-def reactive_power_control(voltage):
+def reactive_power_control(voltage, context: ControlContext):
     """无功功率控制函数 - 三段式变参数调节"""
-    global current_reactive_power_value, reactive_power_reached_limit, active_power_in_progress
     
     # 检查是否需要调节
     # 如果电压在 395-400 范围内，视为稳定，不需要调节
@@ -777,7 +779,7 @@ def reactive_power_control(voltage):
         return True
 
     # 如果已经在进行有功功率调节，不再进行无功功率调节
-    if active_power_in_progress:
+    if context.active_power_in_progress:
         return False
     
     logging.info(f"电压({voltage:.2f}V)，开始无功调节")
@@ -811,23 +813,23 @@ def reactive_power_control(voltage):
         delta_v_calc = config['nominal_voltage'] - voltage
         adjustment = k * delta_v_calc
         
-        target_Q = current_reactive_power_value + adjustment
+        target_Q = context.current_reactive_power_value + adjustment
         
         # 5. 限制范围
         target_Q = max(MIN_CONTROL_VALUE, min(MAX_CONTROL_VALUE, target_Q))
         
         # 检查是否卡在边界
-        if abs(target_Q - current_reactive_power_value) < 0.1:
+        if abs(target_Q - context.current_reactive_power_value) < 0.1:
             logging.info(f"无功功率({target_Q:.1f})已无可调节空间或变化太小")
             if target_Q <= MIN_CONTROL_VALUE or target_Q >= MAX_CONTROL_VALUE:
-                reactive_power_reached_limit = True
+                context.reactive_power_reached_limit = True
                 logging.info("无功功率已达到极限，准备切换有功功率调节")
                 return False
             break
 
         # 6. 执行调节
-        if write_control_value(target_Q):
-            current_reactive_power_value = target_Q
+        if write_control_value(target_Q, context):
+            context.current_reactive_power_value = target_Q
             logging.info(f"无功调节: 电压{voltage:.2f}V, 偏差{abs_dev:.1f}V, k={k}, 调整{adjustment:.1f}, 目标Q={target_Q:.1f}")
         else:
             logging.error("无功控制指令发送失败")
@@ -856,16 +858,15 @@ def get_active_power_value(data):
                     return float(value * 1000)
     return None
 
-def write_control_value(control_value=None):
-    """写入控制值"""
-    global control_start_time, control_value_set
+def write_control_value(control_value=None, context: ControlContext | None = None):
+    """写入控制值，并同步更新控制上下文。"""
     # 如果没有提供控制值，则使用配置中的默认值
     if control_value is None:
         control_value = config["control_value"]
 
-    # 记录控制开始时间
-    control_start_time = time.time() * 1000  # 转换为毫秒
-    control_value_set = False
+    if context:
+        context.control_start_time = time.time() * 1000  # 转换为毫秒
+        context.control_value_set = False
 
     if write_tag(config["group"], config["control_tag"], control_value):
         logging.info(f"控制成功: {config['control_tag']} = {control_value}")
@@ -883,9 +884,8 @@ def write_active_power_value(power_value):
     logging.error(f"有功功率控制失败: {power_value}")
     return False
 
-def should_control(voltage):
+def should_control(voltage, context: ControlContext):
     """判断是否需要进行控制"""
-    global last_control_time
     
     # 检查电压是否在正常范围内
     if voltage >= lower_threshold and voltage <= upper_threshold:
@@ -898,7 +898,7 @@ def should_control(voltage):
     
     # 检查控制间隔时间
     current_time = time.time()
-    if current_time - last_control_time < config["control_interval"]:
+    if current_time - context.last_control_time < config["control_interval"]:
         # 但是，如果电压偏差很大（>30V），则忽略控制间隔时间
         if voltage_deviation > 30:
             logging.info(f"电压偏差较大({voltage_deviation:.2f}V)，忽略控制间隔时间限制")
@@ -992,9 +992,7 @@ def pcs_coordinated_control(voltage):
 
 def main():
     """主函数"""
-    global control_start_time, voltage_recovery_start_time, control_value_set, control_executed, last_control_time, stable_voltage_start_time, last_control_value, last_fine_tune_time
-    global current_reactive_power_value, reactive_power_reached_limit, active_power_in_progress, current_active_power_value
-    global second_reactive_power_value, second_reactive_reached_limit, active_power_adjusted
+    context = ControlContext()
     logging.info("开始监控逆变器电压...")
     logging.info(f"电压上限阈值: {upper_threshold:.1f}V")
     logging.info(f"电压下限阈值: {lower_threshold:.1f}V")
@@ -1008,19 +1006,18 @@ def main():
             # 获取稳定的电压值
             voltage = get_stable_voltage_value()
             if voltage is not None:
-                global last_voltage
                 if voltage is not None:
                     # 只有当电压值发生变化时才打印
-                    if last_voltage is None or abs(voltage - last_voltage) > 0.001:  # 容差比较
+                    if context.last_voltage is None or abs(voltage - context.last_voltage) > 0.001:  # 容差比较
                         logging.info(f"当前电压: {voltage}V")
-                        last_voltage = voltage  # 更新上一次的电压值
+                        context.last_voltage = voltage  # 更新上一次的电压值
                     
                     # 获取当前控制值用于状态跟踪
                     control_data = read_inverter_data()
                     if control_data:
                         control_value = get_control_value(control_data)
                         if control_value is not None:
-                            current_reactive_power_value = control_value  # 更新当前无功功率值
+                            context.current_reactive_power_value = control_value  # 更新当前无功功率值
                     
                     # 检查电压是否需要调节（简化逻辑）
                     
@@ -1053,69 +1050,73 @@ def main():
 
                         # 第一阶段：调节第一台逆变器无功功率
 
-                        if not reactive_power_reached_limit:
+                        if not context.reactive_power_reached_limit:
                             logging.info("开始调节第一台逆变器无功功率")
-                            reactive_result = reactive_power_control(voltage)
+                            reactive_result = reactive_power_control(voltage, context)
                             
                             if reactive_result:
                                 # 第一台无功调节成功，检查电压
                                 final_voltage = get_stable_voltage_value()
                                 if final_voltage is not None and (final_voltage >= 395 and final_voltage <= 400):
                                     logging.info(f"第一台无功调节后电压({final_voltage:.2f}V)已达标，无需继续调节")
-                                    reactive_power_reached_limit = False
-                                    second_reactive_reached_limit = False
+                                    context.reactive_power_reached_limit = False
+                                    context.second_reactive_reached_limit = False
                                 elif final_voltage is not None and final_voltage <= 390 * 1.02:
                                     logging.info(f"第一台无功调节后电压({final_voltage:.2f}V)已降至阈值以下，无需继续调节")
-                                    reactive_power_reached_limit = False
-                                    second_reactive_reached_limit = False
+                                    context.reactive_power_reached_limit = False
+                                    context.second_reactive_reached_limit = False
                                 else:
                                     # 第一台无功调节完成但电压仍不正常，重置标志允许继续调节
-                                    reactive_power_reached_limit = False
+                                    context.reactive_power_reached_limit = False
                             else:
                                 # 第一台无功调节达到极限值，检查第二台
-                                reactive_power_reached_limit = True
+                                context.reactive_power_reached_limit = True
                                 logging.info("第一台逆变器无功功率已达极限值，检查第二台逆变器")
                         
                         # 第二阶段：如果第一台已达极限值，调节第二台逆变器无功功率
-                        if reactive_power_reached_limit and not second_reactive_reached_limit:
+                        if context.reactive_power_reached_limit and not context.second_reactive_reached_limit:
                             logging.info("开始调节第二台逆变器无功功率")
-                            second_result = second_reactive_power_control(voltage)
+                            second_result = second_reactive_power_control(voltage, context)
                             
                             if second_result:
                                 # 第二台无功调节成功，检查电压
                                 final_voltage = get_stable_voltage_value()
                                 if final_voltage is not None and (final_voltage >= 395 and final_voltage <= 400):
                                     logging.info(f"第二台无功调节后电压({final_voltage:.2f}V)已达标，无需继续调节")
-                                    reactive_power_reached_limit = False
-                                    second_reactive_reached_limit = False
+                                    context.reactive_power_reached_limit = False
+                                    context.second_reactive_reached_limit = False
                                 elif final_voltage is not None and final_voltage <= 390 * 1.02:
                                     logging.info(f"第二台无功调节后电压({final_voltage:.2f}V)已降至阈值以下，无需继续调节")
-                                    reactive_power_reached_limit = False
-                                    second_reactive_reached_limit = False
+                                    context.reactive_power_reached_limit = False
+                                    context.second_reactive_reached_limit = False
                                 else:
                                     # 第二台无功调节完成但电压仍不正常，重置标志允许继续调节
-                                    second_reactive_reached_limit = False
+                                    context.second_reactive_reached_limit = False
                             else:
                                 # 第二台无功调节也达到极限值
-                                second_reactive_reached_limit = True
+                                context.second_reactive_reached_limit = True
                                 logging.info("第二台逆变器无功功率也已达极限值，准备调节有功功率")
                         
                         # 第三阶段：如果两台逆变器都达到无功功率极限值且电压仍不正常，调节有功功率
-                        if reactive_power_reached_limit and second_reactive_reached_limit and (voltage < 395 or voltage > 400):
+                        if (
+                            context.reactive_power_reached_limit
+                            and context.second_reactive_reached_limit
+                            and (voltage < 395 or voltage > 400)
+                        ):
                             logging.info("两台逆变器无功功率均已达到极限值，切换到有功功率调节")
-                            if active_power_control(voltage):
+                            if active_power_control(voltage, context):
                                 # 有功调节成功，重置无功功率标志以便下次可以重新尝试无功调节
-                                reactive_power_reached_limit = False
-                                second_reactive_reached_limit = False
+                                context.reactive_power_reached_limit = False
+                                context.second_reactive_reached_limit = False
                     
                     # 4. 检查电压是否在稳定范围内
                     if voltage >= 395 and voltage <= 400:
                         # 电压稳定，重置所有标志
                         logging.info(f"电压已稳定在({voltage:.2f}V)，重置控制状态")
-                        reactive_power_reached_limit = False
-                        second_reactive_reached_limit = False
-                        active_power_in_progress = False
-                        active_power_adjusted = False
+                        context.reactive_power_reached_limit = False
+                        context.second_reactive_reached_limit = False
+                        context.active_power_in_progress = False
+                        context.active_power_adjusted = False
                     else:
                         # 电压在正常范围内，无需控制
                         voltage_deviation = voltage - config["nominal_voltage"]
